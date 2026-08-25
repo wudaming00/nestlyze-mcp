@@ -12,7 +12,7 @@ Talk to [Nestlyze](https://nestlyze.com) directly from Claude Desktop, Claude Co
 | `analyze_property(address, beds, baths, sqft)` | Full 6-agent due-diligence report (~30-60s). |
 
 Plus one resource:
-- `nestlyze://accuracy` — the live MAPE accuracy table (per-metro).
+- `nestlyze://accuracy` — the published accuracy summary, including sample size and refresh date.
 
 ## Install
 
@@ -55,17 +55,21 @@ Set `NESTLYZE_API_BASE`:
 NESTLYZE_API_BASE=http://localhost:8000 python nestlyze_mcp.py
 ```
 
+To use a signed-in Nestlyze account's credits, also set
+`NESTLYZE_BEARER_TOKEN` to that account's API bearer token. The server sends
+it only to the configured Nestlyze API base.
+
 ## Example prompts (after install)
 
 - "Use the nestlyze tools to find homes in Mountain View, CA under $2M with 3+ beds."
 - "Run an analyze_property on 1287 NW 132nd Blvd, Newberry FL."
-- "What's Nestimate's published MAPE for the Bay Area?"
+- "What's Nestimate's published accuracy for the Bay Area?"
 
 ## Notes
 
-- The Nestlyze API is rate-limited per IP (~10 analyses/hour anonymous; unlimited with a signed-in account).
+- Anonymous callers receive one free analysis per IP in a rolling 30-day window. Signed-in calls use account credits.
 - `analyze_property` calls the full 6-agent pipeline — expect 30-60s.
-- All requests are unauthenticated by default. If you need to use credits on an account, set `NESTLYZE_BEARER_TOKEN` (not yet wired — file an issue).
+- Requests are unauthenticated by default. Set `NESTLYZE_BEARER_TOKEN` to use a signed-in account.
 
 ## License
 

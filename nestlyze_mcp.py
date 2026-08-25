@@ -18,7 +18,9 @@ for staging / local-dev access.
 from __future__ import annotations
 
 import asyncio
+import html
 import os
+import re
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -27,6 +29,12 @@ BASE_URL = os.environ.get("NESTLYZE_API_BASE", "https://nestlyze.com").rstrip("/
 TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 mcp = FastMCP("nestlyze")
+
+
+def _auth_headers() -> dict[str, str]:
+    """Attach an account token when the caller explicitly configured one."""
+    token = os.environ.get("NESTLYZE_BEARER_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 @mcp.tool()
@@ -46,7 +54,8 @@ async def search_listings(
 
     Returns: {listings: [...], count: int, total: int}
     """
-    params: dict = {"limit": min(int(limit), 24)}
+    result_limit = max(1, min(int(limit), 24))
+    params: dict = {"limit": result_limit}
     if city:
         params["city"] = city
     if state:
@@ -60,7 +69,11 @@ async def search_listings(
     if max_beds:
         params["max_beds"] = int(max_beds)
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.get(f"{BASE_URL}/api/v1/listings", params=params)
+        r = await client.get(
+            f"{BASE_URL}/api/v1/listings",
+            params=params,
+            headers=_auth_headers(),
+        )
         r.raise_for_status()
         data = r.json()
     listings = data.get("listings") or data.get("items") or []
@@ -82,7 +95,7 @@ async def search_listings(
                 "listing_url": lst.get("listing_url"),
                 "url": f"{BASE_URL}/listing/{lst.get('id')}",
             }
-            for lst in listings[:limit]
+            for lst in listings[:result_limit]
         ],
         "count": len(listings),
         "total": data.get("total"),
@@ -92,12 +105,14 @@ async def search_listings(
 @mcp.tool()
 async def get_listing_details(listing_id: int) -> dict:
     """Fetch the full enriched detail for one listing. Includes price,
-    Nestimate range, school district (SABS polygon match), days on market,
-    photo count, price history, district-median comparison, and the
-    flood/fire/seismic snapshot.
+    school information, days on market, photos, price history, and the
+    district-median comparison when available.
     """
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.get(f"{BASE_URL}/api/v1/listings/{int(listing_id)}")
+        r = await client.get(
+            f"{BASE_URL}/api/v1/listings/{int(listing_id)}",
+            headers=_auth_headers(),
+        )
         r.raise_for_status()
         return r.json()
 
@@ -118,14 +133,23 @@ async def get_nestimate(
     payload: dict = {"address": address}
     if asking_price is not None:
         payload["asking_price"] = asking_price
+    property_details: dict = {}
     if beds is not None:
-        payload["beds"] = beds
+        property_details["beds"] = beds
     if baths is not None:
-        payload["baths"] = baths
+        property_details["baths"] = baths
     if sqft is not None:
-        payload["sqft"] = sqft
+        property_details["sqft"] = sqft
+    if property_details:
+        # The production API expects physical attributes under
+        # property_details. Top-level beds/baths/sqft are silently ignored.
+        payload["property_details"] = property_details
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(f"{BASE_URL}/api/v1/nestimate/compute", json=payload)
+        r = await client.post(
+            f"{BASE_URL}/api/v1/nestimate/compute",
+            json=payload,
+            headers=_auth_headers(),
+        )
         r.raise_for_status()
         return r.json()
 
@@ -159,7 +183,12 @@ async def analyze_property(
     if asking_price is not None:
         form_data["asking_price"] = str(asking_price)
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(f"{BASE_URL}/api/v1/analyze", data=form_data)
+        headers = _auth_headers()
+        r = await client.post(
+            f"{BASE_URL}/api/v1/analyze",
+            data=form_data,
+            headers=headers,
+        )
         r.raise_for_status()
         kickoff = r.json()
         job_id = kickoff.get("job_id")
@@ -170,31 +199,61 @@ async def analyze_property(
         # Poll for completion. /api/v1/progress/{job_id} returns a status
         # field; /api/v1/report/{job_id} returns the full report once ready.
         # Total wait capped at 120s to keep MCP calls bounded.
-        for _ in range(60):
-            await asyncio.sleep(2)
-            p = await client.get(f"{BASE_URL}/api/v1/progress/{job_id}")
-            if p.status_code != 200:
-                continue
-            prog = p.json()
-            if prog.get("status") in ("done", "completed", "ready"):
-                break
-            if prog.get("status") in ("failed", "error"):
-                raise RuntimeError(f"Analysis failed: {prog.get('error', 'unknown')}")
-        rep = await client.get(f"{BASE_URL}/api/v1/report/{job_id}")
+        if kickoff.get("status") != "cached":
+            for _ in range(60):
+                await asyncio.sleep(2)
+                p = await client.get(
+                    f"{BASE_URL}/api/v1/progress/{job_id}",
+                    headers=headers,
+                )
+                if p.status_code != 200:
+                    continue
+                prog = p.json()
+                status = prog.get("status")
+                if status in ("complete", "done", "completed", "ready"):
+                    break
+                if status in ("failed", "error"):
+                    raise RuntimeError(
+                        f"Analysis failed: {prog.get('error', 'unknown')}"
+                    )
+            else:
+                raise TimeoutError(
+                    "Nestlyze analysis did not finish within 120 seconds"
+                )
+        rep = await client.get(
+            f"{BASE_URL}/api/v1/report/{job_id}",
+            headers=headers,
+        )
         rep.raise_for_status()
         report = rep.json()
+        if report.get("status") not in ("complete", "done", "completed", "ready"):
+            raise RuntimeError(
+                f"Analysis report is not ready: {report.get('status', 'unknown')}"
+            )
         report["share_url"] = f"{BASE_URL}/report?job={job_id}"
         return report
 
 
 @mcp.resource("nestlyze://accuracy")
 async def accuracy_resource() -> str:
-    """Static Nestimate accuracy table — what MAPE we publish per metro.
-    Loaded from the public /nestimate-accuracy page so it stays in sync.
+    """Published Nestimate accuracy summary with sample size and date.
+    Loaded from the public page's canonical description so it stays in sync.
     """
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.get(f"{BASE_URL}/nestimate-accuracy", headers={"User-Agent": "Googlebot"})
-        return r.text[:8000]  # crawler view; trimmed to fit MCP resource budget
+        r = await client.get(
+            f"{BASE_URL}/nestimate-accuracy",
+            headers={"User-Agent": "Googlebot", **_auth_headers()},
+        )
+        r.raise_for_status()
+        match = re.search(
+            r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+            r.text,
+            flags=re.IGNORECASE,
+        )
+        summary = html.unescape(match.group(1)).strip() if match else (
+            "The public accuracy page did not expose a machine-readable summary."
+        )
+        return f"{summary}\n\nSource: {BASE_URL}/nestimate-accuracy"
 
 
 if __name__ == "__main__":
